@@ -1,0 +1,254 @@
+---
+title: "STAT 6324 Final Project"
+author: "Art Tay"
+output: pdf_document
+format:
+  pdf:
+     documentclass: article
+     papersize: letter
+
+execute:
+  enabled: true
+---
+
+```{r setup, include=FALSE}
+##Setup code
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+# Libraries
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(magrittr)
+library(cutpointr)
+library(vip)
+tidymodels_prefer()
+```
+
+```{r Parallel Setup}
+# Setup parallel computing.
+library(doParallel)
+cl <- makePSOCKcluster(24)
+registerDoParallel(cl)
+```
+
+```{r Data Read}
+# Read in the dataset.
+data_full <- read.csv("Datasets/heart_2020_cleaned.csv", stringsAsFactors = T)
+```
+
+```{r Stratified Train Test Split}
+# 70/30 stratified train-test split.
+# Stratification to ensure that the proportion of positive
+# heart disease case is equivalent across the training,
+# testing, and raw datasets.
+set.seed(123)
+split <- initial_split(data_full, prop = 0.7, strata = HeartDisease)
+data_train <- training(split)
+data_test <- testing(split)
+```
+
+```{r Initialize a Recipe}
+# Defines a recipe for data cleaning.
+cleaning_recipe <- data_train %>% recipe(HeartDisease ~ .)
+```
+
+```{r Feature Engineering}
+# Feature Engineering
+cleaning_recipe %<>%
+    # Adds categorical bins for Physical Health.
+    step_mutate(PhysicalHealth_bin =
+                    cut(PhysicalHealth,
+                        breaks = c(-1, 0, 5, 10, 15, 20, 25, 30))) %>%
+    # Adds categorical bins for Mental Health.
+    step_mutate(MentalHealth_bin =
+                    cut(MentalHealth,
+                        breaks = c(-1, 0, 5, 10, 15, 20, 25, 30))) %>%
+    # Takes the mid-points for AgeCategory to form a numeric variable.
+    step_mutate(AgeCategory_Cont = case_when(
+                    AgeCategory == "18-24" ~ 21,
+                    AgeCategory == "25-29" ~ 27,
+                    AgeCategory == "30-34" ~ 32,
+                    AgeCategory == "35-39" ~ 37,
+                    AgeCategory == "40-44" ~ 42,
+                    AgeCategory == "45-49" ~ 47,
+                    AgeCategory == "50-54" ~ 52,
+                    AgeCategory == "55-59" ~ 57,
+                    AgeCategory == "60-64" ~ 62,
+                    AgeCategory == "65-69" ~ 67,
+                    AgeCategory == "70-74" ~ 72,
+                    AgeCategory == "75-79" ~ 77,
+                    TRUE ~ 82
+                )) %>%
+    # Assigns 1-5 numeric values to the likert scale for General Health.
+    step_mutate(GenHealth_ord = case_when(
+                    GenHealth == "Poor" ~ 1,
+                    GenHealth == "Fair" ~ 2,
+                    GenHealth == "Good" ~ 3,
+                    GenHealth == "Very Good" ~ 4,
+                    TRUE ~ 5
+                )) %>%
+    # Categorical bins for Low Sleep, Too Much and Regular.
+    step_mutate(SleepTime_bin = as.factor(case_when(
+                    SleepTime < 6 ~ "Low",
+                    SleepTime > 9 ~ "Too Much",
+                    TRUE ~ "Regular")
+                ))
+```
+
+```{r, center and scaling}
+# Centers and scales all numeric predictors.
+cleaning_recipe %<>%
+    step_normalize(all_numeric_predictors())
+```
+
+```{r SMOTE}
+# Applies SMOTE method to deal with class imbalance in the response variable.
+cleaning_recipe %<>% step_smotenc(HeartDisease)
+```
+
+```{r Interaction Effects}
+cleaning_recipe %<>%
+    # converts all nominal predictors into dummy variables.
+    step_dummy(all_nominal_predictors()) %>%
+    # creates interaction effect between select variables.
+    step_interact(
+        terms = ~ starts_with("Smoking"):starts_with("Asthma")
+    ) %>%
+    step_interact(
+        terms = ~ starts_with("Smoking"):starts_with("AlcoholDrinking")
+    ) %>%
+    step_interact(
+        terms = ~ starts_with("Race"):starts_with("Sex")
+    ) %>%
+    step_interact(
+        terms = ~ starts_with("AlcoholDrinking"):starts_with("KidneyDisease")
+    ) %>%
+    step_interact(
+        terms = ~ starts_with("BMI"):starts_with("PhysicalActivity")
+    ) %>%
+    step_interact(
+        terms = ~ starts_with("Sex"):starts_with("AlcoholDrinking")
+    )
+```
+
+```{r Corr and NZV filter}
+cleaning_recipe %<>%
+    # Filters out highly correlated predictors.
+    step_corr(all_predictors()) %>%
+    # Filters out near-zero variance predictors.
+    step_nzv(all_predictors())
+```
+
+## Standard Logistic Regression
+```{r}
+# Uses a workflow to define the logistic regression model.
+# The workflow uses the cleaning recipe defined above as
+# well as the glm computation engine to compute the model
+# parameters.
+wkflow_1 <- workflow()
+
+mod_1 <- logistic_reg() %>% set_engine("glm")
+
+wkflow_1 %<>% add_model(mod_1) %>% add_recipe(cleaning_recipe)
+```
+
+```{r}
+# Calculates the model parameters.
+mod_1_fit <- wkflow_1 %>% fit(data = data_train)
+```
+
+```{r}
+# Exacts the model parameters for inference.
+coef <- mod_1_fit %>% extract_fit_parsnip() %>% tidy()
+print(coef, n = 100)
+```
+
+```{r}
+# Extracts predicted probabilities for the 'Yes' class.
+model_1_train_pred <- predict(mod_1_fit,
+    new_data = data_train, type = "prob")[2]
+model_1_train_pred$obs <- data_train$HeartDisease
+
+# Calculates the optimal cutpoint for class assignment
+# based on maximizing the Kappa statistics
+model_1_cut <- model_1_train_pred %>%
+    cutpointr(x = .pred_Yes, class = obs,
+              method = maximize_metric,
+              metric = cohens_kappa, pos_class = "Yes"
+        )
+```
+
+```{r}
+# Extracts predicted probabilities for the 'Yes' class
+# using the fit model on the testing data set.
+model_1_test_pred <- predict(mod_1_fit,
+    new_data = data_test, type = "prob")[2]
+model_1_test_pred$obs <- data_test$HeartDisease
+
+# Assigns class prediction based on the optimal
+# cutpoint calculated from the training dataset.
+model_1_test_pred %<>%
+    mutate(pred.class =
+        ifelse(.pred_Yes >= model_1_cut$optimal_cutpoint,
+        "Yes", "No")) %>%
+    mutate(pred.class = as.factor(pred.class))
+
+# Calculates a confusion matrix based on the
+# testing dataset prediction results.
+model_1_test_cmat <- model_1_test_pred %>%
+    conf_mat(truth = obs, estimate = pred.class)
+summary(model_1_test_cmat)
+```
+
+```{r bier score}
+# Calculates a bier score for the testing dataset
+# predictions.
+test_pred_1 <- as.data.frame(model_1_test_pred)
+test_pred_1$obs_dummy <- ifelse(model_1_test_pred$obs == "Yes", 1, 0)
+model_1_test_bier <- (1 / nrow(test_pred_1)) *
+    sum((test_pred_1$.pred_Yes - test_pred_1$obs_dummy)^2)
+```
+
+```{r}
+# Creates a variable importance plot for the logistic
+# regression model.
+plot_vip <- mod_1_fit %>% extract_fit_parsnip() %>%
+    vip(num_features = 20)
+```
+
+## Penalized Logistic
+```{r}
+# Defines a workflow for a new model.
+wkflow_2 <- workflow()
+
+# Defines the workflow's model to be a penalized
+# regression model that tune the type and amount of
+# penalty using the glmnet algorithm.
+mod_2 <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+    set_engine("glmnet")
+
+# Define the resampling method to be 10-fold cross-validation.
+resamples <- data_train %>% vfold_cv(v = 10)
+
+# Define a grid of tunning parameters to try.
+param_grid <- grid_regular(penalty(), mixture(),
+                           levels = list(penalty = 10, mixture = 10))
+
+# Adds the defined model and previously defined data cleaning to
+# the workflow.
+wkflow_2 %<>% add_model(mod_2) %>% add_recipe(cleaning_recipe)
+```
+
+```{r, cache = T}
+# Fits the above defined model.
+model_2_fit <- wkflow_2 %>%
+               tune_grid(resamples = resamples, grid = param_grid,
+                         metrics = metric_set(roc_auc),
+                         control = control_grid(verbose = TRUE))
+```
+
+```{r}
+# Extracts the optimal penalty.
+best_pen <- select_best(model_2_fit)
+```
