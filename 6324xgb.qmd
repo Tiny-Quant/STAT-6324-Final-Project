@@ -1,0 +1,328 @@
+---
+title: "6324 XGBoost"
+author: "Delaney Helgeson"
+format: 
+  html:
+    self-contained: true
+    theme: lux
+editor: source
+---
+
+helpful link: https://juliasilge.com/blog/xgboost-tune-volleyball/
+
+## PRESENT ON 12/1
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(plotly)
+library(stacks)
+library(tidymodels)
+library(vip)
+setwd("C:/Users/delan/Downloads/STAT6324 Computing in R")
+```
+
+```{r}
+#| message: false
+heart_data <- read.csv("heart_2020_cleaned.csv", stringsAsFactors = TRUE )
+
+set.seed(6324)
+no_indx <- sample(c(1:292422), 18288)
+yes_indx <- sample(c(292423:319795), 1712)
+
+#saveRDS(no_indx, "no_indx.rds")
+#saveRDS(yes_indx, "yes_indx.rds")
+
+yes_indx <- readRDS( "yes_indx.rds")
+no_indx <- readRDS( "no_indx.rds")
+
+heart_data_arranged <- heart_data %>% arrange(HeartDisease)
+
+heart_subset <- heart_data_arranged[c(no_indx, yes_indx),] %>% 
+  mutate(HeartDisease = as_factor(HeartDisease),
+         AgeCategory1 = case_when(
+           AgeCategory == "18-24" ~ 21,
+           AgeCategory == "25-29" ~ 27,
+           AgeCategory == "30-34" ~ 32,
+           AgeCategory == "35-39" ~ 37,
+           AgeCategory == "40-44" ~ 42,
+           AgeCategory == "45-49" ~ 47,
+           AgeCategory == "50-54" ~ 52,
+           AgeCategory == "55-59" ~ 57,
+           AgeCategory == "60-64" ~ 62,
+           AgeCategory == "65-69" ~ 67,
+           AgeCategory == "70-74" ~ 72,
+           AgeCategory == "75-79" ~ 77,
+           AgeCategory == "80 or older" ~ 82,
+         ),
+         AgeCategory = factor(AgeCategory1, ordered = TRUE),
+         GenHealth =  factor(case_when(
+           GenHealth == "Poor" ~ 1,
+           GenHealth == "Fair" ~ 2,
+           GenHealth == "Good" ~ 3,
+           GenHealth == "Very good" ~ 4,
+           GenHealth == "Excellent" ~ 5
+         ), ordered = TRUE),
+         MentalHealth = factor(MentalHealth, ordered = TRUE),
+         PhysicalHealth = factor(PhysicalHealth, ordered = TRUE)) %>%
+  select(-c("AgeCategory1"))
+
+```
+
+mutate(across(where(is_character), as_factor))
+
+```{r}
+heart_subset
+```
+
+# Train/test split
+```{r}
+set.seed(123)
+heart_split  <- initial_split(heart_subset, prop = 0.7, strata = "HeartDisease")
+heart_split  <- readRDS("heart_split_proportional.rds")
+heart_train  <- training(heart_split)
+heart_test   <- testing(heart_split)
+```
+
+
+# Recipe
+```{r}
+# Create recipe
+tidy_rec <- recipe(HeartDisease ~ ., data = heart_train) %>%
+                step_center(all_predictors(), -all_nominal()) %>% 
+                step_scale(all_predictors(), -all_nominal()) %>% 
+                step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE)
+
+# Prep
+tidy_prep <- prep(tidy_rec)
+
+#test
+tidy_rec_test <- recipe(HeartDisease ~ ., data = heart_test) %>%
+                step_center(all_predictors(), -all_nominal()) %>% 
+                step_scale(all_predictors(), -all_nominal()) %>% 
+                step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE)
+
+# Prep & Juice
+tidy_juice_test <- juice(prep(tidy_rec_test))
+```
+
+
+# Fit model
+```{r}
+ctrl_grid <- control_stack_grid()
+tidy_kfolds <- vfold_cv(heart_train, v = 5, repeats = 5, strata = "HeartDisease")
+
+heart_xgb_tidy <- boost_tree(
+                  mode = "classification",
+                  mtry = tune(),
+                  trees = 1000,
+                  min_n = tune(),
+                  tree_depth = tune(),
+                  learn_rate = tune()) %>%
+                  set_engine("xgboost", nthread = 4)
+
+heart_xgb_param <- extract_parameter_set_dials(heart_xgb_tidy) %>% 
+                    update(mtry = mtry(c(1, 5))) %>%
+                    update(min_n = min_n(c(1, 5)))
+
+xgboost_grid <- grid_max_entropy(
+                  heart_xgb_param,
+                  size = 15)
+
+heart_xgb_wf <- workflow() %>% 
+                    add_recipe(tidy_rec) %>% 
+                    add_model(heart_xgb_tidy)
+```
+```{r}
+
+heart_xgb_tune_results <- tune_grid(
+                               heart_xgb_wf,
+                               resamples = tidy_kfolds,
+                               grid = xgboost_grid,
+                               control = ctrl_grid,
+                               metrics = metric_set(accuracy, kap, roc_auc))
+
+saveRDS(heart_xgb_tune_results, "heart_xgb_tune_results_full.rds")
+
+```
+```{r}
+heart_xgb_tune_results <- readRDS("heart_xgb_tune_results_full.rds")
+
+```
+across(is_character as factor)
+
+# View Resampling stats
+```{r}
+collect_metrics(heart_xgb_tune_results)
+```
+
+# Visualize Resampling stats
+```{r}
+supp.labs <- c("Learning Rate", "Min Node Size","Min Predictors at Each Split","Tree Depth")
+names(supp.labs) <- c("learn_rate", "min_n","mtry","tree_depth")
+
+param_names <- list(
+  'learn_rate'="Learning Rate",
+  'min_n'="Min Node Size",
+  'mtry'="Min Predictors at Each Split",
+  'tree_depth'="Tree Depth"
+)
+
+parameter_labeller <- function(variable,value){
+  return(param_names[value])
+}
+
+heart_xgb_tune_results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  select(mean, mtry:learn_rate) %>%
+  pivot_longer(mtry:learn_rate,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x", labeller=parameter_labeller) +
+  labs(x = NULL, y = "Accuracy")
+```
+Main takeaways: lower learning rates are performing better across the board. As for other hyperparameters, there are several combinations of parameters that are performing well; the optimal values of each hyperparameter (mtry, min_n, and tree depth) is dependent on the value of the others. 
+
+
+# See best tuning parameters
+```{r}
+heart_xgb_best_tune_tidy <- heart_xgb_tune_results %>%
+                              select_best("accuracy") 
+
+heart_xgb_best_tune_tidy
+
+```
+
+
+# Update workflow
+```{r}
+heart_final_xgb_tidy <- finalize_model(heart_xgb_tidy, heart_xgb_best_tune_tidy)
+
+#Note that we need to update our workflow
+heart_xgb_wf2 <- workflow() %>% 
+                        add_recipe(tidy_rec) %>% 
+                        add_model(heart_final_xgb_tidy)
+```
+
+# Evaluate on test data
+```{r}
+# To collect Predicted Probabilities
+heart_xgb_tidy_optimal <- boost_tree(
+                  mode = "classification",
+                  mtry = 4,
+                  trees = 1000,
+                  min_n = 3,
+                  tree_depth = 8,
+                  learn_rate = 0.02118914) %>%
+                  set_engine("xgboost", nthread = 25)
+
+heart_xgb_tidy_optimal_fit <- heart_xgb_tidy_optimal %>% fit(HeartDisease ~ ., data = heart_train)
+
+df_predictions <- bind_cols(
+    predict(heart_xgb_tidy_optimal_fit, heart_test),
+    predict(heart_xgb_tidy_optimal_fit, heart_test, type = "prob")
+  )
+
+# To get Predicted Classes
+final_xgb_tidy <- heart_xgb_wf2 %>% 
+                     last_fit(heart_split, metrics = metric_set(accuracy))
+
+final_xgb_tidy %>% collect_metrics()
+
+xgboost_predictions <- heart_xgb_wf2 %>%
+      last_fit(heart_split, metrics = metric_set(accuracy)) %>% 
+      collect_predictions()
+
+xgboost_predictions <- xgboost_predictions %>% mutate(
+  HeartDisease = (ifelse(HeartDisease == "Yes", 1, 0)),
+  .pred_class = (ifelse(.pred_class == "Yes", 1, 0))
+)
+# Yes = 0; No = 1
+confusionMatrix(data=as.factor(xgboost_predictions$HeartDisease), reference = as.factor(xgboost_predictions$.pred_class))
+
+df_predictions2 <-data.frame( cbind(df_predictions, xgboost_predictions$HeartDisease)) %>% 
+  mutate(HeartDisease = ifelse(xgboost_predictions.HeartDisease == 1, "Yes", "No"))
+
+# Calculate brier score
+(1/length(df_predictions$.pred_class)) * sum((df_predictions$.pred_Yes - as.numeric(ifelse(df_predictions2$HeartDisease == "Yes",1,0)))^2)
+
+
+ggnames <- c("Yes" = "True Outcome: Yes", "No" = "True Outcome: No")
+hist_Rf <- ggplot(data=df_predictions2, aes(x=.pred_Yes)) + geom_histogram() + 
+  facet_grid(~factor(df_predictions2$HeartDisease, levels = c("Yes", "No")),
+             labeller = as_labeller(ggnames)) + xlab("Probability of Heart Disease") + ylab("Frequency") +
+  ggtitle("Figure 7: Fitted Probabilities By True Outcome for XGBoost")+
+  theme(plot.title=element_text(hjust=0.5, face='bold'))
+hist_Rf
+
+```
+
+
+
+# Variable Importance
+```{r}
+best_auc <- select_best(heart_xgb_tune_results, "roc_auc")
+
+final_xgb <- finalize_workflow(
+  heart_xgb_wf2,
+  best_auc
+)
+
+variableIMportance <- final_xgb %>%
+  fit(data = heart_train) %>%
+  extract_fit_parsnip() %>%
+  vip::vi() %>%
+  arrange(desc(Importance)) %>%
+  mutate(Variable = case_when(
+    Variable == "AgeCategory_03" ~ "Age Category: 30-34",
+    Variable == "GenHealth_5" ~ "Excellent General Health",
+    Variable == "GenHealth_1" ~ "Poor General Health",
+    Variable == "GenHealth_2" ~ "Fair General Health",
+    Variable == "AgeCategory_01" ~ "Age Category: 18-24",
+    Variable == "AgeCategory_13" ~ "Age Category: 80 or older",
+    Variable == "AgeCategory_12" ~ "Age Category: 75-79",
+    Variable == "AgeCategory_02" ~ "Age Category: 25-29",
+    Variable == "AgeCategory_04" ~ "Age Category: 35-39",
+    Variable == "AgeCategory_06" ~ "Age Category: 45-49",
+    Variable == "AgeCategory_05" ~ "Age Category: 40-42",
+    Variable == "Diabetic_Yes" ~ "Diabetic",
+    Variable == "Stroke_No" ~ "No Stroke",
+    Variable == "Stroke_Yes" ~ "Stroke",
+    Variable == "BMI" ~ "BMI",
+    Variable == "DiffWalking_Yes" ~ "Difficulty Walking",
+    TRUE ~ "Other"
+  ))
+
+variableIMportance %>% 
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  arrange(Overall) %>%
+  mutate(rowname = forcats::fct_inorder(rowname )) %>%
+  
+  
+varimpdataforggplot <-  variableIMportance %>%
+  filter(Variable != "Other") %>% ungroup() %>%
+  dplyr::arrange(desc(Importance))
+
+
+  ggplot(varimpdataforggplot)+
+  geom_col(aes(x = reorder(Variable, Importance), y = Importance))+
+  ggtitle("Variable Importance for XGBoost")+
+  xlab("Variable")+
+  ylab("Overall Importance")+
+  coord_flip()+
+  theme(plot.title=element_text(hjust=0.5, face='bold'))
+
+```
+
+
+
+
+
+
+
