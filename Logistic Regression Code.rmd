@@ -27,9 +27,9 @@ tidymodels_prefer()
 
 ```{r Parallel Setup}
 # Setup parallel computing.
-library(doParallel)
-cl <- makePSOCKcluster(24)
-registerDoParallel(cl)
+#library(doParallel)
+#cl <- makePSOCKcluster(24)
+#registerDoParallel(cl)
 ```
 
 ```{r Data Read}
@@ -140,6 +140,75 @@ cleaning_recipe %<>%
     step_nzv(all_predictors())
 ```
 
+## Baseline Logistic Regression
+```{r}
+wkflow_0 <- workflow()
+
+mod_0 <- logistic_reg() %>% set_engine("glm")
+
+wkflow_0 %<>% add_model(mod_0) %>% add_formula(HeartDisease ~ .)
+wkflow_0
+```
+
+```{r, cache = T}
+mod_0_fit <- wkflow_0 %>% fit(data = data_train)
+```
+
+```{r}
+# Extracts predicted probabilities for the 'Yes' class.
+model_0_train_pred <- predict(mod_0_fit,
+    new_data = data_train, type = "prob")[2]
+model_0_train_pred$obs <- data_train$HeartDisease
+
+# Calculates the optimal cutpoint for class assignment
+# based on maximizing the Kappa statistics
+model_0_cut <- model_0_train_pred %>%
+    cutpointr(x = .pred_Yes, class = obs,
+              method = maximize_metric,
+              metric = cohens_kappa, pos_class = "Yes"
+        )
+```
+
+```{r}
+# Exacts the model parameters for inference.
+coef <- mod_0_fit %>% extract_fit_parsnip() %>% tidy()
+print(coef, n = 100)
+```
+
+```{r}
+# Extracts predicted probabilities for the 'Yes' class
+# using the fit model on the testing data set.
+model_0_test_pred <- predict(mod_0_fit,
+    new_data = data_test, type = "prob")[2]
+model_0_test_pred$obs <- data_test$HeartDisease
+
+# Assigns class prediction based on the optimal
+# cutpoint calculated from the training dataset.
+model_0_test_pred %<>%
+    mutate(pred.class =
+        ifelse(.pred_Yes >= model_0_cut$optimal_cutpoint,
+        "Yes", "No")) %>%
+    mutate(pred.class = as.factor(pred.class))
+
+# Calculates a confusion matrix based on the
+# testing dataset prediction results.
+model_0_test_cmat <- model_0_test_pred %>%
+    conf_mat(truth = obs, estimate = pred.class)
+model_0_cut$optimal_cutpoint
+model_0_test_cmat
+summary(model_0_test_cmat)
+```
+
+```{r}
+# Calculates a bier score for the testing dataset
+# predictions.
+test_pred_0 <- as.data.frame(model_0_test_pred)
+test_pred_0$obs_dummy <- ifelse(model_0_test_pred$obs == "Yes", 1, 0)
+model_0_test_bier <- (1 / nrow(test_pred_0)) *
+    sum((test_pred_0$.pred_Yes - test_pred_0$obs_dummy)^2)
+model_0_test_bier
+```
+
 ## Standard Logistic Regression
 ```{r}
 # Uses a workflow to define the logistic regression model.
@@ -151,13 +220,13 @@ wkflow_1 <- workflow()
 mod_1 <- logistic_reg() %>% set_engine("glm")
 
 wkflow_1 %<>% add_model(mod_1) %>% add_recipe(cleaning_recipe)
+wkflow_1
 ```
 
 ```{r, cache = T}
 # Calculates the model parameters.
 mod_1_fit <- wkflow_1 %>% fit(data = data_train)
 ```
-
 ```{r}
 # Exacts the model parameters for inference.
 coef <- mod_1_fit %>% extract_fit_parsnip() %>% tidy()
@@ -198,6 +267,8 @@ model_1_test_pred %<>%
 # testing dataset prediction results.
 model_1_test_cmat <- model_1_test_pred %>%
     conf_mat(truth = obs, estimate = pred.class)
+model_1_cut$optimal_cutpoint
+model_1_test_cmat
 summary(model_1_test_cmat)
 ```
 
@@ -208,6 +279,7 @@ test_pred_1 <- as.data.frame(model_1_test_pred)
 test_pred_1$obs_dummy <- ifelse(model_1_test_pred$obs == "Yes", 1, 0)
 model_1_test_bier <- (1 / nrow(test_pred_1)) *
     sum((test_pred_1$.pred_Yes - test_pred_1$obs_dummy)^2)
+model_1_test_bier
 ```
 
 ```{r}
